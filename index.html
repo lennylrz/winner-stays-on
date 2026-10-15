@@ -463,7 +463,7 @@ function normalizeTable(x, no) {
 }
 function idleLimit(T) { return T && T.private ? PRIVATE_IDLE_MS : IDLE_MS; }
 function people(T) { return T ? (T.a ? 1 : 0) + (T.b ? 1 : 0) + T.queue.length : 0; }
-function isLive(T, now) { return !!(T && T.sessionId) && people(T) > 0 && now - T.activeAt < idleLimit(T); }
+function isLive(T, now) { return !!(T && T.sessionId) && (people(T) > 0 || now - T.startedAt < 120000) && now - T.activeAt < idleLimit(T); }
 function newSession(no, id, now, priv) { return { ...defaultTable(no), sessionId: id, startedAt: now, activeAt: now, private: !!priv }; }
 function fillTable(T0) {
   const T = { ...T0, queue: [...T0.queue] };
@@ -903,7 +903,7 @@ function half(T, side, id, pv, loading) {
     return h("div", { class: cls }, h("div", { class: "half-btn" },
       h("span", { class: "h-eyebrow", text: eyebrow }),
       h("span", { class: "h-wait", text: side === "a" ? "The table is free" : "Waiting for a challenger" }),
-      w && S.kind !== "supabase" && h("button", { type: "button", class: "on-table", id: "table-add-" + side, onclick: openPicker }, "Add players")));
+      w && isAdmin() && h("button", { type: "button", class: "on-table", id: "table-add-" + side, onclick: openPicker }, "Add players")));
   }
   const s = stat(id), nm = nameOf(id);
   const odds = pv ? (side === "a" ? [pv.aWin, pv.aLose] : [pv.bWin, pv.bLose]) : null;
@@ -962,8 +962,8 @@ function queueSection(T) {
   const ids = T.queue.filter(id => S.players.has(id));
   const sec = h("section", { class: "stack", "aria-label": "Queue" },
     h("div", { class: "sec-head" }, h("h2", { text: "Next up" }),
-      w && S.kind !== "supabase" && h("button", { type: "button", class: "btn", id: "queue-add", onclick: openPicker }, icon("plus"), "Add players")));
-  if (!ids.length) sec.append(h("p", { class: "list empty", text: w && S.kind !== "supabase" ? "Nobody is waiting. Add players to line up the next games." : "Nobody is waiting." }));
+      w && isAdmin() && h("button", { type: "button", class: "btn", id: "queue-add", onclick: openPicker }, icon("plus"), "Add players")));
+  if (!ids.length) sec.append(h("p", { class: "list empty", text: w && isAdmin() ? "Nobody is waiting. Add players to line up the next games." : "Nobody is waiting." }));
   else sec.append(h("ol", { class: "list" }, ids.map((id, i) => h("li", {}, h("div", { class: "item" },
     h("span", { class: "pos", text: String(i + 1) }),
     h("span", { class: "nm", text: nameOf(id) }),
@@ -992,7 +992,7 @@ function viewRankings() {
     h("div", { class: "sec-head" },
       h("div", { class: "stack tight" }, h("h2", { text: "Rankings" }),
         ready() && h("span", { class: "muted small num", text: Dd.ranked.length + " ranked · " + plural(counted, "game", "games") })),
-      w && S.kind !== "supabase" && h("button", { type: "button", class: "btn", id: "rank-add", onclick: () => openSheet({ type: "add", queue: false, added: [], err: "" }) }, icon("plus"), "Add player")));
+      w && isAdmin() && h("button", { type: "button", class: "btn", id: "rank-add", onclick: () => openSheet({ type: "add", queue: false, added: [], err: "" }) }, icon("plus"), "Add player")));
   if (!ready()) { sec.append(h("p", { class: "list empty", text: "Loading the ladder…" })); v.append(sec); return v; }
   if (Dd.ranked.length) {
     sec.append(leaderCard(Dd.ranked[0]));
@@ -1288,7 +1288,7 @@ function ratingChart(s) {
 
 /* picker sheet */
 function buildPicker(sh) {
-  const input = h("input", { class: "input", id: "pick-q", type: "search", enterkeyhint: "done", placeholder: S.kind === "supabase" ? "Search signed-in players" : "Search or type a new name", autocomplete: "off", autocapitalize: "words", value: sh.q,
+  const input = h("input", { class: "input", id: "pick-q", type: "search", enterkeyhint: "done", placeholder: isAdmin() ? "Search or type a new name" : "Search signed-in players", autocomplete: "off", autocapitalize: "words", value: sh.q,
     oninput: e => { sh.q = e.target.value; sh.err = ""; updateSheet(true); },
     onkeydown: e => { if (e.key === "Enter") { e.preventDefault(); pickerEnter(sh); } } });
   const dyn = h("div", { class: "stack" });
@@ -1303,7 +1303,7 @@ function buildPicker(sh) {
 }
 function pickerCandidates(sh) {
   const at = seated(), qn = norm(sh.q);
-  const pool = derive().players.filter(p => !p.archived && at.get(p.id) !== sh.no && (!S.online || S.online.has(p.id)));
+  const pool = derive().players.filter(p => !p.archived && at.get(p.id) !== sh.no && (isAdmin() || !S.online || S.online.has(p.id)));
   const list = (qn ? pool.filter(p => norm(p.name).includes(qn)) : pool)
     .sort((x, y) => ((at.has(x.id) ? 1 : 0) - (at.has(y.id) ? 1 : 0)) || (stat(y.id).lastAt - stat(x.id).lastAt) || byName(x, y));
   return { pool, list, qn, at };
@@ -1313,7 +1313,7 @@ function pickerList(sh) {
   const out = [];
   const existing = qn ? [...S.players.values()].find(p => norm(p.name) === qn) : null;
   if (sh.err) out.push(h("p", { class: "err", role: "alert", text: sh.err }));
-  if (qn && !existing && S.kind !== "supabase") out.push(h("button", { type: "button", class: "btn block", id: "pick-new", onclick: () => pickerCreate(sh) }, icon("plus"), "Add “" + cleanName(sh.q) + "” as a new player"));
+  if (qn && !existing && isAdmin()) out.push(h("button", { type: "button", class: "btn block", id: "pick-new", onclick: () => pickerCreate(sh) }, icon("plus"), "Add “" + cleanName(sh.q) + "” as a new player"));
   if (existing && existing.archived) out.push(h("p", { class: "muted small", text: existing.name + " is archived. Open them from Rankings to bring them back." }));
   if (list.length) out.push(h("div", { class: "list" }, list.map(p => {
     const pos = sh.sel.indexOf(p.id), elsewhere = at.get(p.id);
@@ -1323,7 +1323,7 @@ function pickerList(sh) {
       elsewhere ? h("span", { class: "tag", text: "At Table " + elsewhere })
         : pos >= 0 ? h("span", { class: "order", "aria-label": "Position " + (pos + 1), text: String(pos + 1) }) : h("span", { class: "rt", text: ratingText(stat(p.id)) }));
   })));
-  else if (!qn) out.push(h("p", { class: "list empty", text: pool.length ? "No matches." : S.kind === "supabase" ? "Nobody else has signed in yet. Players sign in on their own phone first." : "Nobody else is on the ladder yet. Type a name to add someone." }));
+  else if (!qn) out.push(h("p", { class: "list empty", text: pool.length ? "No matches." : !isAdmin() ? "Nobody else has signed in yet. Players sign in on their own phone first." : "Nobody else is on the ladder yet. Type a name to add someone." }));
   return out;
 }
 function togglePick(sh, id, on) {
@@ -1447,7 +1447,7 @@ function signInStatus(sh) {
 function accountBody() {
   return [
     h("div", { class: "stack tight" }, h("h2", { id: "sheet-title", text: S.name || "Your account" }), h("p", { class: "muted small", text: S.organiser ? "Organiser" : "Player" })),
-    h("p", { class: "small", text: S.organiser ? "You’re the admin. You can run any table and rename, archive or void. Like everyone else, you can only put yourself on a table." : "You can start a session, join a table and record games. You can undo a game you recorded for 10 minutes. After that, only an organiser can void it." }),
+    h("p", { class: "small", text: S.organiser ? "You’re the admin. You can put anyone on any table, enter any score, add players, and rename, archive or void." : "You can start a session, join a table and record games. You can undo a game you recorded for 10 minutes. After that, only an organiser can void it." }),
     h("div", { class: "row" }, h("button", { type: "button", class: "btn", id: "signout", onclick: async () => { closeSheet(); try { await S.store.signOut(); } catch (_) {} await refreshIdentity(); } }, "Sign out")),
   ];
 }
@@ -1501,7 +1501,7 @@ function commitTable(T, code) {
   const prev = tableOf(T.no);
   let next = cleanTable({ ...T, activeAt: Date.now() });
   // A session ends by itself once nobody is left, or once a game loses one of its two players
-  if (next.sessionId && (people(next) === 0 || (people(next) < 2 && people(prev) >= 2))) {
+  if (next.sessionId && ((people(next) === 0 && people(prev) > 0) || (people(next) < 2 && people(prev) >= 2))) {
     next = { ...defaultTable(T.no), activeAt: Date.now() };
     if (S.current === T.no) { S.pick = null; S.custom = null; }
   }
@@ -1546,11 +1546,12 @@ async function confirmStart(sh) {
   if (sh.priv && !/^\d{4}$/.test(code)) { sh.err = "Pick a 4-digit code."; updateSheet(true); return; }
   if (liveOf(sh.no)) { closeSheet(); return; }
   let T = newSession(sh.no, newId("s"), Date.now(), sh.priv);
-  if (S.uid) T = fillTable({ ...T, queue: [S.uid] });
+  if (S.uid && !isAdmin()) T = fillTable({ ...T, queue: [S.uid] });
   const elsewhere = seated().get(S.uid);
   if (elsewhere && elsewhere !== sh.no) { sh.err = "You’re already at Table " + elsewhere + ". Leave that queue first."; updateSheet(true); return; }
   closeSheet();
   const ok = await commitTable(T, sh.priv ? code : null);
+  if (ok && isAdmin()) openPicker();
   if (ok && sh.priv) showToast({ text: "Table " + sh.no + " is private. Share the code " + code + " with whoever you want to play." });
 }
 function startBody(sh) {
