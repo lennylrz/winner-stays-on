@@ -599,6 +599,7 @@ function supaStore(sb) {
     },
     async signOut() { const t = sess && sess.token; save(null); if (t) await sb.rpc("wso_sign_out", { p_token: t }); },
     forget() { save(null); },
+    signedIn: async () => ok(await sb.rpc("wso_signed_in")),
     resetSignIn: id => call("wso_reset_sign_in", { p_player: id }),
     async subscribe(on) {
       const load = async () => {
@@ -989,7 +990,7 @@ function viewRankings() {
     h("div", { class: "sec-head" },
       h("div", { class: "stack tight" }, h("h2", { text: "Rankings" }),
         ready() && h("span", { class: "muted small num", text: Dd.ranked.length + " ranked · " + plural(counted, "game", "games") })),
-      w && isAdmin() && h("button", { type: "button", class: "btn", id: "rank-add", onclick: () => openSheet({ type: "add", queue: false, added: [], err: "" }) }, icon("plus"), "Add player")));
+      w && S.kind !== "supabase" && h("button", { type: "button", class: "btn", id: "rank-add", onclick: () => openSheet({ type: "add", queue: false, added: [], err: "" }) }, icon("plus"), "Add player")));
   if (!ready()) { sec.append(h("p", { class: "list empty", text: "Loading the ladder…" })); v.append(sec); return v; }
   if (Dd.ranked.length) {
     sec.append(leaderCard(Dd.ranked[0]));
@@ -1113,7 +1114,12 @@ function gameRow(g, w) {
 
 /* ---------- sheets ---------- */
 function openPlayer(id) { openSheet({ type: "player", id, editing: false, draft: "", err: "", confirmArchive: false }); }
-function openPicker() { if (cur()) openSheet({ type: "picker", q: "", sel: [], err: "", no: S.current }); }
+function openPicker() {
+  if (!cur()) return;
+  const sh = { type: "picker", q: "", sel: [], err: "", no: S.current };
+  if (S.kind === "supabase") { S.online = new Set(); S.store.signedIn().then(ids => { S.online = new Set(ids || []); if (S.sheet === sh) updateSheet(true); }).catch(() => {}); }
+  openSheet(sh);
+}
 function openSheet(sh) {
   if (!canWrite() && (sh.type === "picker" || sh.type === "add")) return;
   lastFocus = document.activeElement;
@@ -1280,7 +1286,7 @@ function ratingChart(s) {
 
 /* picker sheet */
 function buildPicker(sh) {
-  const input = h("input", { class: "input", id: "pick-q", type: "search", enterkeyhint: "done", placeholder: "Search or type a new name", autocomplete: "off", autocapitalize: "words", value: sh.q,
+  const input = h("input", { class: "input", id: "pick-q", type: "search", enterkeyhint: "done", placeholder: S.kind === "supabase" ? "Search signed-in players" : "Search or type a new name", autocomplete: "off", autocapitalize: "words", value: sh.q,
     oninput: e => { sh.q = e.target.value; sh.err = ""; updateSheet(true); },
     onkeydown: e => { if (e.key === "Enter") { e.preventDefault(); pickerEnter(sh); } } });
   const dyn = h("div", { class: "stack" });
@@ -1295,7 +1301,7 @@ function buildPicker(sh) {
 }
 function pickerCandidates(sh) {
   const at = seated(), qn = norm(sh.q);
-  const pool = derive().players.filter(p => !p.archived && at.get(p.id) !== sh.no);
+  const pool = derive().players.filter(p => !p.archived && at.get(p.id) !== sh.no && (!S.online || S.online.has(p.id)));
   const list = (qn ? pool.filter(p => norm(p.name).includes(qn)) : pool)
     .sort((x, y) => ((at.has(x.id) ? 1 : 0) - (at.has(y.id) ? 1 : 0)) || (stat(y.id).lastAt - stat(x.id).lastAt) || byName(x, y));
   return { pool, list, qn, at };
@@ -1305,7 +1311,7 @@ function pickerList(sh) {
   const out = [];
   const existing = qn ? [...S.players.values()].find(p => norm(p.name) === qn) : null;
   if (sh.err) out.push(h("p", { class: "err", role: "alert", text: sh.err }));
-  if (qn && !existing) out.push(h("button", { type: "button", class: "btn block", id: "pick-new", onclick: () => pickerCreate(sh) }, icon("plus"), "Add “" + cleanName(sh.q) + "” as a new player"));
+  if (qn && !existing && S.kind !== "supabase") out.push(h("button", { type: "button", class: "btn block", id: "pick-new", onclick: () => pickerCreate(sh) }, icon("plus"), "Add “" + cleanName(sh.q) + "” as a new player"));
   if (existing && existing.archived) out.push(h("p", { class: "muted small", text: existing.name + " is archived. Open them from Rankings to bring them back." }));
   if (list.length) out.push(h("div", { class: "list" }, list.map(p => {
     const pos = sh.sel.indexOf(p.id), elsewhere = at.get(p.id);
@@ -1315,7 +1321,7 @@ function pickerList(sh) {
       elsewhere ? h("span", { class: "tag", text: "At Table " + elsewhere })
         : pos >= 0 ? h("span", { class: "order", "aria-label": "Position " + (pos + 1), text: String(pos + 1) }) : h("span", { class: "rt", text: ratingText(stat(p.id)) }));
   })));
-  else if (!qn) out.push(h("p", { class: "list empty", text: pool.length ? "No matches." : "Nobody else is on the ladder yet. Type a name to add someone." }));
+  else if (!qn) out.push(h("p", { class: "list empty", text: pool.length ? "No matches." : S.kind === "supabase" ? "Nobody else has signed in yet. Players sign in on their own phone first." : "Nobody else is on the ladder yet. Type a name to add someone." }));
   return out;
 }
 function togglePick(sh, id, on) {
