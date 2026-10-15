@@ -388,7 +388,7 @@ button.game-btn:hover{background:var(--sunk)}
 <script>
 "use strict";
 /*<logic>*/
-const START = 1000, K_NEW = 40, K_EST = 20, PROVISIONAL = 10, FORMATS = [3, 5, 11], TABLES = [1, 2], IDLE_MS = 10 * 60 * 1000;
+const START = 1000, K_NEW = 40, K_EST = 20, PROVISIONAL = 10, FORMATS = [3, 5, 11], TABLES = [1, 2], IDLE_MS = 10 * 60 * 1000, PRIVATE_IDLE_MS = 5 * 60 * 1000;
 function expected(ra, rb) { return 1 / (1 + Math.pow(10, (rb - ra) / 400)); }
 function kFor(n) { return n < PROVISIONAL ? K_NEW : K_EST; }
 function toInt(v, d) { const n = Number(v); return Number.isFinite(n) ? Math.round(n) : d; }
@@ -444,7 +444,7 @@ function preview(ra, na, rb, nb) {
     bWin: R(rb + kb * ea) - R(rb), bLose: R(rb - kb * (1 - ea)) - R(rb),
   };
 }
-function defaultTable(no) { return { no, sessionId: null, startedAt: 0, activeAt: 0, a: null, b: null, queue: [], target: null, streak: 0, rejoin: true }; }
+function defaultTable(no) { return { no, sessionId: null, startedAt: 0, activeAt: 0, a: null, b: null, queue: [], target: null, streak: 0, rejoin: true, private: false }; }
 function normalizeTable(x, no) {
   const T = defaultTable(no);
   if (!x || typeof x !== "object") return T;
@@ -458,10 +458,12 @@ function normalizeTable(x, no) {
   T.target = FORMATS.includes(Number(x.target)) ? Number(x.target) : null;
   T.streak = Math.max(0, toInt(x.streak, 0));
   T.rejoin = x.rejoin !== false;
+  T.private = !!x.private;
   return T;
 }
-function isLive(T, now) { return !!(T && T.sessionId) && now - T.activeAt < IDLE_MS; }
-function newSession(no, id, now) { return { ...defaultTable(no), sessionId: id, startedAt: now, activeAt: now }; }
+function idleLimit(T) { return T && T.private ? PRIVATE_IDLE_MS : IDLE_MS; }
+function isLive(T, now) { return !!(T && T.sessionId) && now - T.activeAt < idleLimit(T); }
+function newSession(no, id, now, priv) { return { ...defaultTable(no), sessionId: id, startedAt: now, activeAt: now, private: !!priv }; }
 function fillTable(T0) {
   const T = { ...T0, queue: [...T0.queue] };
   if (!T.a && T.b) { T.a = T.b; T.b = null; T.streak = 0; }
@@ -551,7 +553,7 @@ function claudeStore(db, user) {
     },
     removeGame: (id, g) => db.doc("games/" + (g.wk || weekKey(g.at))).update({ games: { [id]: null } }),
     voidGame: (id, g, v) => db.doc("games/" + (g.wk || weekKey(g.at))).update({ games: { [id]: { v } } }),
-    setTable: T => db.doc("tables/" + T.no).set({ sessionId: T.sessionId, startedAt: T.startedAt, activeAt: T.activeAt, a: T.a || null, b: T.b || null, queue: T.queue.slice(), target: T.target || null, streak: T.streak, rejoin: T.rejoin, updatedAt: Date.now() }),
+    setTable: T => db.doc("tables/" + T.no).set({ sessionId: T.sessionId, startedAt: T.startedAt, activeAt: T.activeAt, a: T.a || null, b: T.b || null, queue: T.queue.slice(), target: T.target || null, streak: T.streak, rejoin: T.rejoin, private: !!T.private, updatedAt: Date.now() }),
   };
 }
 
@@ -561,7 +563,7 @@ function supaStore(sb) {
   const ok = r => { if (r.error) throw r.error; return r.data; };
   const player = r => ({ id: r.id, name: cleanName(r.name), archived: !!r.archived, createdAt: Date.parse(r.created_at) || 0 });
   const game = r => ({ w: r.w, l: r.l, ws: r.ws, ls: r.ls, t: r.t, at: Number(r.at), v: !!r.v, tableNo: r.table_no, sessionId: r.session_id });
-  const table = r => ({ sessionId: r.session_id, startedAt: Number(r.started_at) || 0, activeAt: Number(r.active_at) || 0, a: r.a, b: r.b, queue: r.queue, target: r.target, streak: r.streak, rejoin: r.rejoin });
+  const table = r => ({ sessionId: r.session_id, startedAt: Number(r.started_at) || 0, activeAt: Number(r.active_at) || 0, a: r.a, b: r.b, queue: r.queue, target: r.target, streak: r.streak, rejoin: r.rejoin, private: !!r.private });
   async function all(name, col) {
     const out = [];
     for (let from = 0; ; from += 1000) {
@@ -589,8 +591,8 @@ function supaStore(sb) {
       save({ token: sess.token, player_id: r.data.player_id, name: r.data.name, organiser: !!r.data.organiser });
       return { uid: sess.player_id, writable: true, signedIn: true, name: sess.name, organiser: sess.organiser };
     },
-    async signIn(name, number) {
-      const d = ok(await sb.rpc("wso_sign_in", { p_name: name, p_number: number }));
+    async signIn(name, number, create) {
+      const d = ok(await sb.rpc("wso_sign_in", { p_name: name, p_number: number, p_create: !!create }));
       if (!d || d.error) { const e = new Error((d && d.error) || "failed"); e.code = (d && d.error) || "failed"; e.minutes = d && d.minutes; throw e; }
       save({ token: d.token, player_id: d.player_id, name: d.name, organiser: !!d.organiser });
       return d;
@@ -623,14 +625,17 @@ function supaStore(sb) {
     addGame: (id, g) => call("wso_add_game", { p_id: id, p_game: { w: g.w, l: g.l, ws: g.ws, ls: g.ls, t: g.t, at: g.at, table_no: g.tableNo || null, session_id: g.sessionId || null } }),
     removeGame: id => call("wso_remove_game", { p_id: id }),
     voidGame: (id, g, v) => call("wso_void_game", { p_id: id, p_void: v }),
-    setTable: T => call("wso_set_table", { p_no: T.no, p_t: { session_id: T.sessionId, started_at: T.startedAt || null, active_at: T.activeAt || null, a: T.a || null, b: T.b || null, queue: T.queue.slice(), target: T.target || null, streak: T.streak, rejoin: T.rejoin } }),
+    setTable: (T, code) => call("wso_set_table", { p_no: T.no, p_code: code || null, p_t: { session_id: T.sessionId, started_at: T.startedAt || null, active_at: T.activeAt || null, a: T.a || null, b: T.b || null, queue: T.queue.slice(), target: T.target || null, streak: T.streak, rejoin: T.rejoin } }),
   };
 }
 
 /* ---------- derived state ---------- */
 function ready() { return S.loaded.players && S.loaded.games && S.loaded.tables; }
 function canWrite() { return !!S.store && !S.readOnly && S.writable !== false; }
-function canManage() { return canWrite() && (S.kind !== "supabase" || S.organiser); }
+function isAdmin() { return S.kind !== "supabase" || !!S.organiser; }
+function canManage() { return canWrite() && isAdmin(); }
+function mine(T) { return !!T && !!S.uid && (T.a === S.uid || T.b === S.uid || T.queue.includes(S.uid)); }
+function canRun(T) { return canWrite() && (isAdmin() || !T || mine(T)); }
 function needsSignIn() { return S.kind === "supabase" && !S.signedIn; }
 function openSignIn() { openSheet({ type: "signin", err: "", busy: false, name: "", number: "" }); }
 function startOfToday() { const d = new Date(); d.setHours(0, 0, 0, 0); return d.getTime(); }
@@ -806,7 +811,7 @@ function tableCardSmall(no, w) {
       h("span", { text: a ? nameOf(a) : "" }), h("span", { text: b ? nameOf(b) : "" })),
     h("span", { class: "tc-info" },
       h("span", { class: "tc-name", text: "Table " + no }),
-      h("span", { class: "status" + (T ? " busy" : "") }, h("i", { "aria-hidden": "true" }), T ? "In use" : "Free"),
+      h("span", { class: "status" + (T ? " busy" : "") }, h("i", { "aria-hidden": "true" }), T ? (T.private ? "Private" : "In use") : "Free"),
       h("span", { class: "tc-meta", text: meta.join(" · ") }),
       h("span", { class: "tc-go" }, T ? "Open table" : w ? "Start a session" : "View table", icon("go"))));
 }
@@ -815,13 +820,13 @@ function tableCardSmall(no, w) {
 function viewTable(no) {
   const v = h("div", { class: "view" });
   if (S.status === "offline") { v.append(h("div", { class: "wrap pad" }, offlineNotice())); return v; }
-  const w = canWrite(), T = liveOf(no), loading = !ready();
+  const T = liveOf(no), w = canRun(T), loading = !ready();
   const top = h("div", { class: "tv-top" },
     h("button", { type: "button", class: "back", id: "back", onclick: closeTable }, icon("back"), "Tables"),
     T && w && !S.confirmEnd && h("button", { type: "button", class: "ghost-floor", id: "end", onclick: () => { S.confirmEnd = true; rerender(); } }, "End session"));
   const head = h("div", { class: "court-head" },
     h("div", { class: "stack tight" }, h("h2", { text: "Table " + no }),
-      h("span", { class: "status" + (T ? " busy" : "") }, h("i", { "aria-hidden": "true" }), loading ? "Loading" : T ? "In use" : "Free")),
+      h("span", { class: "status" + (T ? " busy" : "") }, h("i", { "aria-hidden": "true" }), loading ? "Loading" : T ? (T.private ? "Private" : "In use") : "Free")),
     T && lengthChip(T, w));
   const court = h("div", { class: "wrap court-in" }, top, head);
   if (S.confirmEnd && T && w) court.append(h("div", { class: "card", id: "end-card" },
@@ -837,6 +842,7 @@ function viewTable(no) {
     !w && needsSignIn() && h("div", { class: "row" }, h("button", { type: "button", class: "btn primary", id: "signin-here", onclick: openSignIn }, "Sign in")),
     w && h("div", { class: "row" }, h("button", { type: "button", class: "btn primary", id: "start-here", onclick: () => startSession(no) }, icon("plus"), "Start a session"))));
   else if (T) {
+    if (canWrite() && !w) court.append(joinCard(T));
     const below = belowTable(T, w);
     if (below) court.append(below);
     court.append(sessionLine(T, w));
@@ -846,12 +852,12 @@ function viewTable(no) {
   return v;
 }
 function sessionLine(T, w) {
-  const idle = Date.now() - T.activeAt, left = Math.max(1, Math.ceil((IDLE_MS - idle) / 60000));
+  const idle = Date.now() - T.activeAt, left = Math.max(1, Math.ceil((idleLimit(T) - idle) / 60000));
   const n = sessionGames(T);
-  if (idle > 7 * 60000) return h("div", { class: "idle", role: "status" },
+  if (idle > idleLimit(T) - 3 * 60000) return h("div", { class: "idle", role: "status" },
     h("span", { text: "No activity for " + Math.floor(idle / 60000) + " min. The session ends in " + plural(left, "minute", "minutes") + "." }),
     w && h("button", { type: "button", class: "ghost-floor", id: "keep", onclick: () => keepTable(T.no) }, "Keep the table"));
-  return h("p", { class: "session-line", text: "Session since " + fmtTime(T.startedAt) + " · " + plural(n, "game", "games") + " · ends after 10 minutes without a game" });
+  return h("p", { class: "session-line", text: "Session since " + fmtTime(T.startedAt) + " · " + plural(n, "game", "games") + " · ends after " + (T.private ? 5 : 10) + " minutes without a game" + (T.private ? " · private" : "") });
 }
 function lengthChip(T, w) {
   const t = T.target;
@@ -886,7 +892,7 @@ function ball(b) {
   return h("span", { class: cls, style, "aria-hidden": "true" }, h("span", { class: "bs" }), h("span", { class: "bb" }));
 }
 function half(T, side, id, pv, loading) {
-  const w = canWrite();
+  const w = canRun(T);
   const cls = "half " + side + (S.pick === side ? " picked" : "") + (S.pick && S.pick !== side ? " dim" : "");
   const eyebrow = side === "a" ? "On the table" : "Challenger";
   if (loading || !T) return h("div", { class: cls }, h("div", { class: "half-btn" }, loading ? [h("span", { class: "h-eyebrow", text: eyebrow }), h("span", { class: "h-wait", text: "Loading…" })] : null));
@@ -894,7 +900,7 @@ function half(T, side, id, pv, loading) {
     return h("div", { class: cls }, h("div", { class: "half-btn" },
       h("span", { class: "h-eyebrow", text: eyebrow }),
       h("span", { class: "h-wait", text: side === "a" ? "The table is free" : "Waiting for a challenger" }),
-      w && h("button", { type: "button", class: "on-table", id: "table-add-" + side, onclick: openPicker }, "Add players")));
+      w && isAdmin() && h("button", { type: "button", class: "on-table", id: "table-add-" + side, onclick: openPicker }, "Add players")));
   }
   const s = stat(id), nm = nameOf(id);
   const odds = pv ? (side === "a" ? [pv.aWin, pv.aLose] : [pv.bWin, pv.bLose]) : null;
@@ -949,12 +955,12 @@ function scorePanel(T) {
   return card;
 }
 function queueSection(T) {
-  const w = canWrite();
+  const w = canRun(T);
   const ids = T.queue.filter(id => S.players.has(id));
   const sec = h("section", { class: "stack", "aria-label": "Queue" },
     h("div", { class: "sec-head" }, h("h2", { text: "Next up" }),
-      w && h("button", { type: "button", class: "btn", id: "queue-add", onclick: openPicker }, icon("plus"), "Add players")));
-  if (!ids.length) sec.append(h("p", { class: "list empty", text: w ? "Nobody is waiting. Add players to line up the next games." : "Nobody is waiting." }));
+      w && isAdmin() && h("button", { type: "button", class: "btn", id: "queue-add", onclick: openPicker }, icon("plus"), "Add players")));
+  if (!ids.length) sec.append(h("p", { class: "list empty", text: w && isAdmin() ? "Nobody is waiting. Add players to line up the next games." : "Nobody is waiting." }));
   else sec.append(h("ol", { class: "list" }, ids.map((id, i) => h("li", {}, h("div", { class: "item" },
     h("span", { class: "pos", text: String(i + 1) }),
     h("span", { class: "nm", text: nameOf(id) }),
@@ -983,7 +989,7 @@ function viewRankings() {
     h("div", { class: "sec-head" },
       h("div", { class: "stack tight" }, h("h2", { text: "Rankings" }),
         ready() && h("span", { class: "muted small num", text: Dd.ranked.length + " ranked · " + plural(counted, "game", "games") })),
-      w && h("button", { type: "button", class: "btn", id: "rank-add", onclick: () => openSheet({ type: "add", queue: false, added: [], err: "" }) }, icon("plus"), "Add player")));
+      w && isAdmin() && h("button", { type: "button", class: "btn", id: "rank-add", onclick: () => openSheet({ type: "add", queue: false, added: [], err: "" }) }, icon("plus"), "Add player")));
   if (!ready()) { sec.append(h("p", { class: "list empty", text: "Loading the ladder…" })); v.append(sec); return v; }
   if (Dd.ranked.length) {
     sec.append(leaderCard(Dd.ranked[0]));
@@ -1142,6 +1148,8 @@ function updateSheet(force) {
     sheetEls.body.replaceChildren(...playerBody(sh));
   } else if (sh.type === "account") {
     sheetEls.body.replaceChildren(...accountBody());
+  } else if (sh.type === "start") {
+    sheetEls.body.replaceChildren(...startBody(sh));
   } else if (sh.type === "picker") {
     sheetEls.dyn.replaceChildren(...pickerList(sh));
     const n = sh.sel.length;
@@ -1391,7 +1399,7 @@ function buildSignIn(sh) {
   const dyn = h("div", { class: "stack" });
   sheetEls.body.append(
     h("div", { class: "stack tight" }, h("h2", { id: "sheet-title", text: "Sign in" }),
-      h("p", { class: "muted small", text: "Use your name as it appears on the ladder. The first time you sign in, your student number becomes your key." })),
+      h("p", { class: "muted small", text: "Use your name as it appears on the ladder, or a new one to join. The first time you sign in, your student number becomes your key. You stay signed in on this phone until you sign out." })),
     form, dyn);
   Object.assign(sheetEls, { dyn, input, go });
   updateSheet(true);
@@ -1401,9 +1409,10 @@ async function submitSignIn(sh) {
   const name = cleanName(sh.name), number = String(sh.number || "").replace(/[\s-]/g, "");
   if (!name) { sh.err = "Type your name."; updateSheet(true); return; }
   if (number.length < 3) { sh.err = "Type your student number."; updateSheet(true); return; }
-  sh.err = ""; sh.busy = true; updateSheet(true);
+  sh.err = ""; sh.create = false; sh.busy = true; updateSheet(true);
   try {
-    const d = await S.store.signIn(name, number);
+    const d = await S.store.signIn(name, number, !!sh.joinNew);
+    sh.joinNew = false;
     sh.busy = false;
     closeSheet();
     await refreshIdentity();
@@ -1411,7 +1420,9 @@ async function submitSignIn(sh) {
   } catch (e) {
     sh.busy = false;
     const code = e && e.code, known = [...S.players.values()].find(p => norm(p.name) === norm(name)), nm = known ? known.name : name;
-    sh.err = code === "no_player" ? "There’s no " + name + " on the ladder yet. Ask someone who’s signed in to add you, then try again."
+    sh.create = code === "no_player";
+    sh.err = code === "no_player" ? "There’s no " + name + " on the ladder yet. New here? Join with this name and student number."
+      : code === "archived" ? nm + " has been archived. Ask an organiser to bring them back."
       : code === "wrong_number" ? "That student number doesn’t match " + nm + "’s."
       : code === "locked" ? "Too many wrong tries. Wait " + (e.minutes || 15) + " minutes and try again."
       : code === "bad_number" ? "Type your student number."
@@ -1421,12 +1432,14 @@ async function submitSignIn(sh) {
 }
 function signInStatus(sh) {
   if (sheetEls && sheetEls.go) { sheetEls.go.disabled = !!sh.busy; sheetEls.go.textContent = sh.busy ? "Signing in…" : "Sign in"; }
-  return sh.err ? [h("p", { class: "err", role: "alert", text: sh.err })] : [];
+  const out = sh.err ? [h("p", { class: "err", role: "alert", text: sh.err })] : [];
+  if (sh.create && !sh.busy) out.push(h("button", { type: "button", class: "btn block", id: "si-join", onclick: () => { sh.joinNew = true; submitSignIn(sh); } }, "Join the ladder as " + cleanName(sh.name)));
+  return out;
 }
 function accountBody() {
   return [
     h("div", { class: "stack tight" }, h("h2", { id: "sheet-title", text: S.name || "Your account" }), h("p", { class: "muted small", text: S.organiser ? "Organiser" : "Player" })),
-    h("p", { class: "small", text: S.organiser ? "You can run tables and record games, and you’re the one who renames, archives and voids." : "You can run tables, add players and record games. You can undo a game you recorded for 10 minutes. After that, only an organiser can void it." }),
+    h("p", { class: "small", text: S.organiser ? "You’re the admin. You can run any table, add anyone, and rename, archive or void." : "You can start a session, join a table and record games. You can undo a game you recorded for 10 minutes. After that, only an organiser can void it." }),
     h("div", { class: "row" }, h("button", { type: "button", class: "btn", id: "signout", onclick: async () => { closeSheet(); try { await S.store.signOut(); } catch (_) {} await refreshIdentity(); } }, "Sign out")),
   ];
 }
@@ -1456,7 +1469,8 @@ function writeFailed(e, msg) {
     showToast({ text: "You’ve been signed out, so that wasn’t saved. Sign in again to carry on." });
     return;
   }
-  if (S.kind === "supabase" && code === "42501") { showToast({ text: "Only an organiser can do that." }); return; }
+  if (S.kind === "supabase" && code === "28P01") { showToast({ text: "That code isn’t right." }); return; }
+  if (S.kind === "supabase" && code === "42501") { showToast({ text: /in use/.test(text) ? "Someone else just took this table." : /yourself/.test(text) ? "You can only add yourself. Everyone else signs in and joins on their own phone." : "Only an organiser can do that." }); return; }
   const denied = code === "invalid_argument" || code === "not_granted" || code === "not_allowed" || code === "42501" || /row-level security|permission denied/i.test(text);
   if (denied && S.writable !== true) {
     S.readOnly = true; rerender();
@@ -1467,7 +1481,7 @@ function writeFailed(e, msg) {
   if (code === "quota_exceeded") { showToast({ text: "The ladder’s storage is full, so new changes can’t be saved." }); return; }
   showToast({ text: msg + " Check your connection and try again." });
 }
-function writeTable(T) { return enqueue("table:" + T.no, () => withRetry(() => S.store.setTable(T))); }
+function writeTable(T, code) { return enqueue("table:" + T.no, () => withRetry(() => S.store.setTable(T, code))); }
 function cleanTable(T) {
   const gone = id => { const p = S.players.get(id); return !!(p && p.archived); };
   const out = { ...T, queue: T.queue.filter(id => !gone(id)) };
@@ -1475,12 +1489,12 @@ function cleanTable(T) {
   if (out.b && gone(out.b)) out.b = null;
   return fillTable(out);
 }
-function commitTable(T) {
+function commitTable(T, code) {
   const prev = tableOf(T.no);
   const next = cleanTable({ ...T, activeAt: Date.now() });
   S.tables.set(T.no, next);
   rerender();
-  return writeTable(next).catch(e => { S.tables.set(T.no, prev); rerender(); writeFailed(e, "That change wasn’t saved."); });
+  return writeTable(next, code).then(() => true, e => { S.tables.set(T.no, prev); rerender(); writeFailed(e, "That change wasn’t saved."); return false; });
 }
 function sameSeats(x, y) { return !!x && !!y && x.sessionId === y.sessionId && x.a === y.a && x.b === y.b && x.target === y.target && x.streak === y.streak && x.queue.join() === y.queue.join(); }
 
@@ -1510,8 +1524,55 @@ function startSession(no) {
   if (!canWrite()) { openTable(no); return; }
   if (liveOf(no)) { openTable(no); return; }
   openTable(no);
+  if (S.kind === "supabase") { openSheet({ type: "start", no, priv: false, code: "", err: "" }); return; }
   commitTable(newSession(no, newId("s"), Date.now()));
   openPicker();
+}
+async function confirmStart(sh) {
+  const code = String(sh.code || "").trim();
+  if (sh.priv && !/^\d{4}$/.test(code)) { sh.err = "Pick a 4-digit code."; updateSheet(true); return; }
+  if (liveOf(sh.no)) { closeSheet(); return; }
+  let T = newSession(sh.no, newId("s"), Date.now(), sh.priv);
+  if (S.uid && !isAdmin()) T = fillTable({ ...T, queue: [S.uid] });
+  const elsewhere = seated().get(S.uid);
+  if (!isAdmin() && elsewhere && elsewhere !== sh.no) { sh.err = "You’re already at Table " + elsewhere + ". Leave that queue first."; updateSheet(true); return; }
+  closeSheet();
+  const ok = await commitTable(T, sh.priv ? code : null);
+  if (ok && sh.priv) showToast({ text: "Table " + sh.no + " is private. Share the code " + code + " with whoever you want to play." });
+  if (ok && isAdmin()) openPicker();
+}
+function startBody(sh) {
+  return [
+    h("div", { class: "stack tight" }, h("h2", { id: "sheet-title", text: "Start on Table " + sh.no }),
+      h("p", { class: "muted small", text: "An open session lets anyone signed in join the queue. A private one needs your 4-digit code, and it opens up again when you end it or after 5 minutes without a game." })),
+    h("div", { class: "len-row" },
+      h("button", { type: "button", class: "len-btn", id: "start-open", "aria-pressed": String(!sh.priv), onclick: () => { sh.priv = false; sh.err = ""; updateSheet(true); } }, "Open"),
+      h("button", { type: "button", class: "len-btn", id: "start-private", "aria-pressed": String(!!sh.priv), onclick: () => { sh.priv = true; sh.err = ""; updateSheet(true); requestAnimationFrame(() => { const el = document.getElementById("start-code"); if (el) el.focus(); }); } }, "Private")),
+    sh.priv && h("div", { class: "field" }, h("label", { for: "start-code", text: "4-digit code" }),
+      h("input", { class: "input", id: "start-code", inputmode: "numeric", pattern: "[0-9]*", maxlength: "4", autocomplete: "off", value: sh.code, oninput: e => { sh.code = e.target.value.replace(/\D/g, "").slice(0, 4); e.target.value = sh.code; } })),
+    sh.err && h("p", { class: "err", role: "alert", text: sh.err }),
+    h("button", { type: "button", class: "btn primary block", id: "start-go", onclick: () => confirmStart(sh) }, sh.priv ? "Start private session" : "Start session"),
+  ];
+}
+async function joinTable(no, code) {
+  const T = liveOf(no);
+  if (!T || !S.uid || mine(T)) return;
+  const elsewhere = seated().get(S.uid);
+  if (elsewhere && elsewhere !== no) { showToast({ text: "You’re already at Table " + elsewhere + "." }); return; }
+  const ok = await commitTable(fillTable({ ...T, queue: [...T.queue, S.uid] }), code || null);
+  if (ok) { S.joinCode = ""; showToast({ text: "You’re on Table " + no + "." }); }
+}
+function joinCard(T) {
+  if (T.private) return h("form", { class: "card", id: "lock-card", onsubmit: ev => { ev.preventDefault(); if (/^\d{4}$/.test(S.joinCode || "")) joinTable(T.no, S.joinCode); else showToast({ text: "Type the 4-digit code." }); } },
+    h("p", { class: "card-title", text: "Private session" }),
+    h("p", { class: "muted small", text: "Ask the players for the code to join. The table opens up again when they finish or after 5 minutes without a game." }),
+    h("div", { class: "row nowrap" },
+      h("div", { class: "field grow" }, h("label", { for: "join-code", class: "sr", text: "Code" }),
+        h("input", { class: "input", id: "join-code", inputmode: "numeric", pattern: "[0-9]*", maxlength: "4", placeholder: "Code", autocomplete: "off", value: S.joinCode || "", oninput: e => { S.joinCode = e.target.value.replace(/\D/g, "").slice(0, 4); e.target.value = S.joinCode; } })),
+      h("button", { type: "submit", class: "btn primary", id: "join-go" }, "Join")));
+  return h("div", { class: "card" }, h("p", { class: "card-title", text: "Want a game?" }),
+    h("p", { class: "muted small", text: "Join the queue and you’ll step up when it’s your turn." }),
+    h("div", { class: "row" }, h("button", { type: "button", class: "btn primary", id: "join-go", onclick: () => joinTable(T.no) }, icon("plus"), "Join this table")));
 }
 function endSession(no) {
   if (!canWrite()) return;

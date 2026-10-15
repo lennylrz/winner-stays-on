@@ -9,8 +9,10 @@ A live Elo ladder for winner-stays-on ping pong at uni. Pick a free table, start
 - Whoever holds the table stays on until they lose. The loser goes to the back of the queue and the next challenger steps up.
 - Before each game you pick first to 3, 5 or 11.
 - Ratings work like chess.com. Everyone starts at 1000, and after each game both players move by K × (result − expected). K is 40 for a player's first 10 games and 20 after that.
-- Players sign in with their name and student number, no email needed. The first sign-in sets the student number and later ones have to match it. Anyone can watch live without signing in.
-- Signed-in players run tables, add players and record games, and can undo a game they recorded for 10 minutes. Only organisers rename, archive, void games and reset someone's sign-in.
+- Players sign in with their name and student number, no email needed. A new name joins the ladder, and the first sign-in sets the student number. You stay signed in on that phone until you sign out. Anyone can watch live without signing in.
+- Signed-in players start sessions, join tables themselves and record games. Nobody can put someone else on a table except an organiser.
+- A session can be private with a 4-digit code. It opens up again when it ends or after 5 minutes without a game.
+- Organisers can run any table, add anyone, rename, archive, void games and reset someone's sign-in.
 - A wrong result can be undone straight away or voided later, and every rating is recalculated from the full game history.
 
 ## Stack
