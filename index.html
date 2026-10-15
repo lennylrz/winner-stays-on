@@ -357,6 +357,9 @@ button.game-btn:hover{background:var(--sunk)}
 .idle{display:flex;align-items:center;justify-content:center;gap:10px;flex-wrap:wrap;text-align:center;font-size:13px;color:var(--floor-ink);background:rgba(0,0,0,.2);border-radius:12px;padding:9px 12px}
 .pick.off{cursor:default;opacity:.6}
 
+.moved{display:block;padding:10px max(16px,env(safe-area-inset-right,0px)) 10px max(16px,env(safe-area-inset-left,0px));background:var(--ball);color:var(--ball-ink);font-size:13.5px;line-height:1.35;text-align:center;text-decoration:none}
+.moved b{font-weight:700;text-decoration:underline;text-underline-offset:2px}
+
 /* toast */
 .toast{position:fixed;left:0;right:0;bottom:0;z-index:60;display:flex;justify-content:center;padding:0 max(16px,env(safe-area-inset-right,0px)) calc(16px + env(safe-area-inset-bottom,0px)) max(16px,env(safe-area-inset-left,0px));pointer-events:none}
 .toast-card{pointer-events:auto;width:100%;max-width:560px;display:flex;align-items:center;gap:12px;padding:10px 10px 10px 16px;border-radius:12px;background:var(--ink);color:var(--bg);box-shadow:0 10px 30px rgba(0,0,0,.25);font-size:14px;animation:rise .2s ease-out}
@@ -718,9 +721,13 @@ function render() {
   derive();
   renderHeader();
   const view = S.view === "rankings" ? viewRankings() : S.view === "games" ? viewGames() : S.current ? viewTable(S.current) : viewOverview();
-  $("#main").replaceChildren(view);
+  $("#main").replaceChildren(...(S.kind === "claude" ? [movedBanner(), view] : [view]));
   if (S.sheet) updateSheet(false);
   restoreFocus(keep);
+}
+function movedBanner() {
+  return h("a", { class: "moved", href: "https://winner-stays-on.vercel.app", target: "_blank", rel: "noopener" },
+    h("span", { text: "The ladder now runs at " }), h("b", { text: "winner-stays-on.vercel.app" }), h("span", { text: ". Games recorded here don\u2019t sync there." }));
 }
 function renderHeader() {
   for (const b of document.querySelectorAll(".tab")) b.setAttribute("aria-selected", String(b.dataset.view === S.view));
