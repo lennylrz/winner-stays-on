@@ -487,7 +487,7 @@ const MINUS = "−", R = Math.round;
 const VIEWS = ["tables", "rankings", "games"];
 const $ = q => document.querySelector(q);
 const S = {
-  store: null, kind: null, status: "connecting", writable: null, readOnly: false, signedIn: false, email: null, uid: null,
+  store: null, kind: null, status: "connecting", writable: null, readOnly: false, signedIn: false, name: null, organiser: false, uid: null,
   players: new Map(), games: new Map(), tables: new Map(TABLES.map(no => [no, defaultTable(no)])),
   loaded: { players: false, games: false, tables: false },
   view: "tables", current: null, pick: null, custom: null, confirmEnd: false, openGame: null, confirmVoid: null, gamesShown: 60,
@@ -509,7 +509,7 @@ function claudeStore(db, user) {
         try { uid = await user.id(); } catch (_) {}
         try { const [o, e] = await Promise.all([user.isOwner(), user.canEdit()]); writable = !!(o || e); } catch (_) {}
       }
-      return { uid, writable, signedIn: true, email: null };
+      return { uid, writable, signedIn: true, name: null, organiser: !!writable };
     },
     subscribe(on) {
       unsub.forEach(u => { try { u(); } catch (_) {} });
@@ -559,7 +559,6 @@ function claudeStore(db, user) {
 function supaStore(sb) {
   let channel = null;
   const ok = r => { if (r.error) throw r.error; return r.data; };
-  const changed = r => { const d = ok(r); if (!d || !d.length) { const e = new Error("Not allowed"); e.code = "not_allowed"; throw e; } return d; };
   const player = r => ({ id: r.id, name: cleanName(r.name), archived: !!r.archived, createdAt: Date.parse(r.created_at) || 0 });
   const game = r => ({ w: r.w, l: r.l, ws: r.ws, ls: r.ls, t: r.t, at: Number(r.at), v: !!r.v, tableNo: r.table_no, sessionId: r.session_id });
   const table = r => ({ sessionId: r.session_id, startedAt: Number(r.started_at) || 0, activeAt: Number(r.active_at) || 0, a: r.a, b: r.b, queue: r.queue, target: r.target, streak: r.streak, rejoin: r.rejoin });
@@ -571,22 +570,38 @@ function supaStore(sb) {
       if (rows.length < 1000) return out;
     }
   }
+  const KEY = "wso.session";
+  let sess = null;
+  try { sess = JSON.parse(localStorage.getItem(KEY) || "null"); } catch (_) {}
+  if (!sess || typeof sess.token !== "string") sess = null;
+  function save(v) { sess = v; try { if (v) localStorage.setItem(KEY, JSON.stringify(v)); else localStorage.removeItem(KEY); } catch (_) {} }
+  async function call(fn, args) {
+    if (!sess) { const e = new Error("Sign in again"); e.code = "28000"; throw e; }
+    return ok(await sb.rpc(fn, { p_token: sess.token, ...args }));
+  }
   return {
     kind: "supabase",
     async identity() {
-      const res = await sb.auth.getSession();
-      const s = res && res.data && res.data.session;
-      if (!s) return { uid: null, writable: false, signedIn: false, email: null };
-      const r = await sb.from("organisers").select("email").limit(1);
-      return { uid: s.user.id, writable: !r.error && !!(r.data && r.data.length), signedIn: true, email: s.user.email || null };
+      if (!sess) return { uid: null, writable: false, signedIn: false, name: null, organiser: false };
+      const r = await sb.rpc("wso_me", { p_token: sess.token });
+      if (r.error) return { uid: sess.player_id, writable: true, signedIn: true, name: sess.name, organiser: !!sess.organiser };
+      if (!r.data) { save(null); return { uid: null, writable: false, signedIn: false, name: null, organiser: false }; }
+      save({ token: sess.token, player_id: r.data.player_id, name: r.data.name, organiser: !!r.data.organiser });
+      return { uid: sess.player_id, writable: true, signedIn: true, name: sess.name, organiser: sess.organiser };
     },
-    onAuth(fn) { sb.auth.onAuthStateChange(ev => { if (ev === "SIGNED_IN" || ev === "SIGNED_OUT" || ev === "USER_UPDATED") setTimeout(fn, 0); }); },
-    signIn: email => sb.auth.signInWithOtp({ email, options: { emailRedirectTo: location.origin + location.pathname } }).then(ok),
-    signOut: () => sb.auth.signOut().then(ok),
-    verifyCode: (email, token) => sb.auth.verifyOtp({ email, token, type: "email" }).then(ok),
+    async signIn(name, number) {
+      const d = ok(await sb.rpc("wso_sign_in", { p_name: name, p_number: number }));
+      if (!d || d.error) { const e = new Error((d && d.error) || "failed"); e.code = (d && d.error) || "failed"; e.minutes = d && d.minutes; throw e; }
+      save({ token: d.token, player_id: d.player_id, name: d.name, organiser: !!d.organiser });
+      return d;
+    },
+    async signOut() { const t = sess && sess.token; save(null); if (t) await sb.rpc("wso_sign_out", { p_token: t }); },
+    forget() { save(null); },
+    resetSignIn: id => call("wso_reset_sign_in", { p_player: id }),
     async subscribe(on) {
       const load = async () => {
-        const [p, g, t] = await Promise.all([all("players", "created_at"), all("games", "at"), all("tables", "id")]);
+        const [p, g0, t] = await Promise.all([all("players", "created_at"), all("games", "at"), all("tables", "id")]);
+        const g = g0.filter(r => !r.removed);
         on.players(new Map(p.map(r => [r.id, player(r)])));
         on.games(new Map(g.map(r => [r.id, game(r)])));
         on.tables(new Map(t.map(r => [Number(r.id), table(r)])));
@@ -596,25 +611,28 @@ function supaStore(sb) {
       let first = true;
       channel = sb.channel("ladder")
         .on("postgres_changes", { event: "*", schema: "public", table: "players" }, x => x.eventType === "DELETE" ? on.patchPlayer(x.old.id, null) : on.patchPlayer(x.new.id, player(x.new)))
-        .on("postgres_changes", { event: "*", schema: "public", table: "games" }, x => x.eventType === "DELETE" ? on.patchGame(x.old.id, null) : on.patchGame(x.new.id, game(x.new)))
+        .on("postgres_changes", { event: "*", schema: "public", table: "games" }, x => x.eventType === "DELETE" || x.new.removed ? on.patchGame((x.new && x.new.id) || x.old.id, null) : on.patchGame(x.new.id, game(x.new)))
         .on("postgres_changes", { event: "*", schema: "public", table: "tables" }, x => { if (x.new && x.new.id) on.patchTable(Number(x.new.id), table(x.new)); })
         .subscribe(status => {
           if (status === "SUBSCRIBED") { if (!first) load().catch(on.error); first = false; }
         });
     },
     gameKey: id => "game:" + id,
-    addPlayer: (id, p) => sb.from("players").insert({ id, name: p.name }).then(ok),
-    updatePlayer: (id, patch) => sb.from("players").update(patch).eq("id", id).select("id").then(changed),
-    addGame: (id, g) => sb.from("games").insert({ id, w: g.w, l: g.l, ws: g.ws, ls: g.ls, t: g.t, at: g.at, table_no: g.tableNo || null, session_id: g.sessionId || null }).then(ok),
-    removeGame: id => sb.from("games").delete().eq("id", id).select("id").then(changed),
-    voidGame: (id, g, v) => sb.from("games").update({ v }).eq("id", id).select("id").then(changed),
-    setTable: T => sb.from("tables").update({ session_id: T.sessionId, started_at: T.startedAt || null, active_at: T.activeAt || null, a: T.a || null, b: T.b || null, queue: T.queue.slice(), target: T.target || null, streak: T.streak, rejoin: T.rejoin, updated_at: new Date().toISOString() }).eq("id", T.no).select("id").then(changed),
+    addPlayer: (id, p) => call("wso_add_player", { p_id: id, p_name: p.name }),
+    updatePlayer: (id, patch) => call("wso_update_player", { p_id: id, p_name: patch.name == null ? null : patch.name, p_archived: patch.archived == null ? null : patch.archived }),
+    addGame: (id, g) => call("wso_add_game", { p_id: id, p_game: { w: g.w, l: g.l, ws: g.ws, ls: g.ls, t: g.t, at: g.at, table_no: g.tableNo || null, session_id: g.sessionId || null } }),
+    removeGame: id => call("wso_remove_game", { p_id: id }),
+    voidGame: (id, g, v) => call("wso_void_game", { p_id: id, p_void: v }),
+    setTable: T => call("wso_set_table", { p_no: T.no, p_t: { session_id: T.sessionId, started_at: T.startedAt || null, active_at: T.activeAt || null, a: T.a || null, b: T.b || null, queue: T.queue.slice(), target: T.target || null, streak: T.streak, rejoin: T.rejoin } }),
   };
 }
 
 /* ---------- derived state ---------- */
 function ready() { return S.loaded.players && S.loaded.games && S.loaded.tables; }
 function canWrite() { return !!S.store && !S.readOnly && S.writable !== false; }
+function canManage() { return canWrite() && (S.kind !== "supabase" || S.organiser); }
+function needsSignIn() { return S.kind === "supabase" && !S.signedIn; }
+function openSignIn() { openSheet({ type: "signin", err: "", busy: false, name: "", number: "" }); }
 function startOfToday() { const d = new Date(); d.setHours(0, 0, 0, 0); return d.getTime(); }
 function derive() {
   if (D && !dirty) return D;
@@ -736,8 +754,8 @@ function renderHeader() {
   else if (S.status === "ready") {
     kids.push(h("span", { class: "live", title: "Live" }, h("i", { "aria-hidden": "true" }), h("span", { class: "lt", text: "Live" })));
     if (S.kind === "supabase") kids.push(S.signedIn
-      ? h("button", { type: "button", class: "acct", id: "acct", "aria-label": "Your account", onclick: () => openSheet({ type: "account" }) }, (S.email || "?").charAt(0).toUpperCase())
-      : h("button", { type: "button", class: "hdr-btn", id: "signin", onclick: () => openSheet({ type: "signin", err: "", sent: "", sending: false, code: "" }) }, "Sign in"));
+      ? h("button", { type: "button", class: "acct", id: "acct", "aria-label": "Signed in as " + (S.name || "you"), onclick: () => openSheet({ type: "account" }) }, (S.name || "?").charAt(0).toUpperCase())
+      : h("button", { type: "button", class: "hdr-btn", id: "signin", onclick: openSignIn }, "Sign in"));
     else if (!canWrite()) kids.push(h("span", { class: "pill", text: "View only" }));
   }
   $("#mode").replaceChildren(...kids);
@@ -815,7 +833,8 @@ function viewTable(no) {
   court.append(tableCard(T, loading));
   if (!loading && !T) court.append(h("div", { class: "card" },
     h("p", { class: "card-title", text: "Table " + no + " is free" }),
-    h("p", { class: "muted small", text: w ? "Start a session, then add who’s playing." : "When someone starts a session here, it shows up live." }),
+    h("p", { class: "muted small", text: w ? "Start a session, then add who’s playing." : needsSignIn() ? "Sign in with your name and student number to start a session." : "When someone starts a session here, it shows up live." }),
+    !w && needsSignIn() && h("div", { class: "row" }, h("button", { type: "button", class: "btn primary", id: "signin-here", onclick: openSignIn }, "Sign in")),
     w && h("div", { class: "row" }, h("button", { type: "button", class: "btn primary", id: "start-here", onclick: () => startSession(no) }, icon("plus"), "Start a session"))));
   else if (T) {
     const below = belowTable(T, w);
@@ -1034,7 +1053,7 @@ function onToggleDet(e) { const d = e.currentTarget; if (d.open) S.det.add(d.id)
 function viewGames() {
   const v = h("div", { class: "view wrap pad" });
   if (S.status === "offline") { v.append(offlineNotice()); return v; }
-  const Dd = derive(), w = canWrite();
+  const Dd = derive(), w = canManage();
   const all = Dd.games.slice().reverse();
   const counted = all.filter(g => !g.v).length, voided = all.length - counted;
   v.append(h("div", { class: "sec-head" }, h("div", { class: "stack tight" }, h("h2", { text: "Games" }),
@@ -1170,7 +1189,7 @@ function playerBody(sh) {
         h("span", { class: "rt", text: String(R(x.r)) })));
     }))));
   }
-  if (w) {
+  if (canManage()) {
     const acts = h("div", { class: "row" });
     if (!sh.editing) acts.append(h("button", { type: "button", class: "btn", id: "p-rename", onclick: () => { sh.editing = true; sh.draft = p.name; sh.err = ""; updateSheet(true); const el = document.getElementById("rename"); if (el) el.focus(); } }, "Edit name"));
     if (p.archived) acts.append(h("button", { type: "button", class: "btn", id: "p-unarchive", onclick: () => setArchived(p.id, false) }, "Bring back"));
@@ -1180,6 +1199,9 @@ function playerBody(sh) {
       h("button", { type: "button", class: "btn quiet", id: "p-archive-no", onclick: () => { sh.confirmArchive = false; updateSheet(true); } }, "Keep"));
     else acts.append(h("button", { type: "button", class: "btn quiet", id: "p-archive", onclick: () => { sh.confirmArchive = true; updateSheet(true); } }, "Archive player"));
     out.push(acts);
+    if (S.kind === "supabase" && !p.archived) out.push(h("div", { class: "stack tight" },
+      h("p", { class: "muted small", text: sh.resetDone ? p.name + " can sign in with a new student number now." : "Forgot their student number, or someone else claimed the name? Reset it and their next sign-in sets a new one." }),
+      !sh.resetDone && h("div", { class: "row" }, h("button", { type: "button", class: "btn quiet", id: "p-reset", onclick: () => resetSignIn(sh) }, "Reset sign-in"))));
   }
   return out;
 }
@@ -1358,52 +1380,59 @@ function addStatus(sh) {
 
 /* sign-in and account sheets (website only) */
 function buildSignIn(sh) {
-  const input = h("input", { class: "input", id: "si-email", type: "email", inputmode: "email", autocomplete: "email", placeholder: "you@example.com", enterkeyhint: "send" });
-  const form = h("form", { class: "row nowrap", onsubmit: async ev => {
-    ev.preventDefault();
-    const email = input.value.trim();
-    if (!/^\S+@\S+\.\S+$/.test(email)) { sh.err = "Enter your email address."; updateSheet(true); return; }
-    sh.err = ""; sh.sending = true; updateSheet(true);
-    try { await S.store.signIn(email); sh.sent = email; }
-    catch (e) { sh.err = "The link couldn’t be sent. " + ((e && e.message) || "Try again in a minute."); }
-    sh.sending = false; updateSheet(true);
-  } }, h("div", { class: "field grow" }, h("label", { for: "si-email", class: "sr", text: "Email" }), input), h("button", { type: "submit", class: "btn primary", id: "si-go" }, "Send link"));
+  const names = h("datalist", { id: "si-names" }, [...S.players.values()].filter(p => !p.archived).sort(byName).map(p => h("option", { value: p.name })));
+  const input = h("input", { class: "input", id: "si-name", list: "si-names", autocomplete: "username", autocapitalize: "words", spellcheck: "false", maxlength: "40", enterkeyhint: "next", value: sh.name, oninput: e => { sh.name = e.target.value; } });
+  const number = h("input", { class: "input", id: "si-number", type: "password", autocomplete: "current-password", maxlength: "32", enterkeyhint: "go", value: sh.number, oninput: e => { sh.number = e.target.value; } });
+  const go = h("button", { type: "submit", class: "btn primary block", id: "si-go" }, "Sign in");
+  const form = h("form", { class: "stack", onsubmit: ev => { ev.preventDefault(); submitSignIn(sh); } },
+    h("div", { class: "field" }, h("label", { for: "si-name", text: "Name" }), input, names),
+    h("div", { class: "field" }, h("label", { for: "si-number", text: "Student number" }), number),
+    go);
   const dyn = h("div", { class: "stack" });
   sheetEls.body.append(
     h("div", { class: "stack tight" }, h("h2", { id: "sheet-title", text: "Sign in" }),
-      h("p", { class: "muted small", text: "Organisers sign in to run tables and record games. Everyone else can watch without an account." })),
+      h("p", { class: "muted small", text: "Use your name as it appears on the ladder. The first time you sign in, your student number becomes your key." })),
     form, dyn);
-  Object.assign(sheetEls, { dyn, input });
+  Object.assign(sheetEls, { dyn, input, go });
   updateSheet(true);
 }
-function signInStatus(sh) {
-  const out = [];
-  if (sh.err) out.push(h("p", { class: "err", role: "alert", text: sh.err }));
-  if (sh.sending) out.push(h("p", { class: "muted small", text: "Sending…" }));
-  if (sh.sent) {
-    out.push(h("div", { class: "notice" }, h("p", { class: "notice-title", text: "Check your email" }),
-      h("p", { text: "Tap the link sent to " + sh.sent + " on this phone and you’ll land back here signed in. If the email shows a code, type it below instead." })));
-    out.push(h("form", { class: "row nowrap", onsubmit: async ev => {
-      ev.preventDefault();
-      const code = String(sh.code || "").replace(/\D/g, "");
-      if (code.length < 6) { sh.err = "Type the code from the email."; updateSheet(true); return; }
-      sh.err = ""; sh.sending = true; updateSheet(true);
-      try { await S.store.verifyCode(sh.sent, code); }
-      catch (e) { sh.err = "That code didn’t work. Check it or send a new link."; }
-      sh.sending = false; updateSheet(true);
-    } }, h("div", { class: "field grow" }, h("label", { for: "si-code", class: "sr", text: "Code from the email" }),
-        h("input", { class: "input", id: "si-code", inputmode: "numeric", autocomplete: "one-time-code", maxlength: "10", placeholder: "Code", value: sh.code || "", oninput: e => { sh.code = e.target.value; } })),
-      h("button", { type: "submit", class: "btn", id: "si-verify" }, "Sign in")));
+async function submitSignIn(sh) {
+  if (sh.busy) return;
+  const name = cleanName(sh.name), number = String(sh.number || "").replace(/[\s-]/g, "");
+  if (!name) { sh.err = "Type your name."; updateSheet(true); return; }
+  if (number.length < 3) { sh.err = "Type your student number."; updateSheet(true); return; }
+  sh.err = ""; sh.busy = true; updateSheet(true);
+  try {
+    const d = await S.store.signIn(name, number);
+    sh.busy = false;
+    closeSheet();
+    await refreshIdentity();
+    showToast({ text: d.first ? "Welcome, " + d.name + ". Your student number is now your key, so use the same one next time." : "Signed in as " + d.name + "." });
+  } catch (e) {
+    sh.busy = false;
+    const code = e && e.code, known = [...S.players.values()].find(p => norm(p.name) === norm(name)), nm = known ? known.name : name;
+    sh.err = code === "no_player" ? "There’s no " + name + " on the ladder yet. Ask someone who’s signed in to add you, then try again."
+      : code === "wrong_number" ? "That student number doesn’t match " + nm + "’s."
+      : code === "locked" ? "Too many wrong tries. Wait " + (e.minutes || 15) + " minutes and try again."
+      : code === "bad_number" ? "Type your student number."
+      : "Couldn’t sign in. Check your connection and try again.";
+    updateSheet(true);
   }
-  return out;
+}
+function signInStatus(sh) {
+  if (sheetEls && sheetEls.go) { sheetEls.go.disabled = !!sh.busy; sheetEls.go.textContent = sh.busy ? "Signing in…" : "Sign in"; }
+  return sh.err ? [h("p", { class: "err", role: "alert", text: sh.err })] : [];
 }
 function accountBody() {
-  const w = canWrite();
   return [
-    h("div", { class: "stack tight" }, h("h2", { id: "sheet-title", text: "Your account" }), h("p", { class: "muted small", text: "Signed in as " + (S.email || "unknown") })),
-    h("p", { class: "small", text: w ? "You’re an organiser, so you can run tables, add players and record games." : "You can watch the ladder, but this account isn’t an organiser, so it can’t record games." }),
-    h("div", { class: "row" }, h("button", { type: "button", class: "btn", id: "signout", onclick: async () => { try { await S.store.signOut(); } catch (_) {} closeSheet(); await refreshIdentity(); } }, "Sign out")),
+    h("div", { class: "stack tight" }, h("h2", { id: "sheet-title", text: S.name || "Your account" }), h("p", { class: "muted small", text: S.organiser ? "Organiser" : "Player" })),
+    h("p", { class: "small", text: S.organiser ? "You can run tables and record games, and you’re the one who renames, archives and voids." : "You can run tables, add players and record games. You can undo a game you recorded for 10 minutes. After that, only an organiser can void it." }),
+    h("div", { class: "row" }, h("button", { type: "button", class: "btn", id: "signout", onclick: async () => { closeSheet(); try { await S.store.signOut(); } catch (_) {} await refreshIdentity(); } }, "Sign out")),
   ];
+}
+async function resetSignIn(sh) {
+  try { await S.store.resetSignIn(sh.id); sh.resetDone = true; updateSheet(true); }
+  catch (e) { writeFailed(e, "The reset didn’t go through."); }
 }
 
 /* ---------- writes ---------- */
@@ -1422,10 +1451,16 @@ async function withRetry(fn) {
 }
 function writeFailed(e, msg) {
   const code = e && e.code, text = (e && e.message) || "";
+  if (S.kind === "supabase" && code === "28000") {
+    S.store.forget(); refreshIdentity();
+    showToast({ text: "You’ve been signed out, so that wasn’t saved. Sign in again to carry on." });
+    return;
+  }
+  if (S.kind === "supabase" && code === "42501") { showToast({ text: "Only an organiser can do that." }); return; }
   const denied = code === "invalid_argument" || code === "not_granted" || code === "not_allowed" || code === "42501" || /row-level security|permission denied/i.test(text);
   if (denied && S.writable !== true) {
     S.readOnly = true; rerender();
-    showToast({ text: S.kind === "supabase" ? "Only organisers can change the ladder. Sign in as one to run a table." : "You can view this ladder, but only its owner can change it." });
+    showToast({ text: S.kind === "supabase" ? "Sign in to run a table." : "You can view this ladder, but only its owner can change it." });
     return;
   }
   if (code === "revoked") { S.readOnly = true; rerender(); return; }
@@ -1686,7 +1721,7 @@ function afterTables() {
 async function refreshIdentity() {
   try {
     const id = await S.store.identity();
-    S.uid = id.uid; S.writable = id.writable; S.signedIn = id.signedIn; S.email = id.email; S.readOnly = false;
+    S.uid = id.uid; S.writable = id.writable; S.signedIn = id.signedIn; S.name = id.name; S.organiser = !!id.organiser; S.readOnly = false;
   } catch (_) { if (S.kind === "supabase") S.writable = false; }
   if (S.sheet && S.sheet.type === "signin" && S.signedIn) closeSheet();
   rerender();
@@ -1695,8 +1730,7 @@ async function connect() {
   const cfg = window.WSO_CONFIG;
   try {
     if (cfg && cfg.supabaseUrl && cfg.supabaseKey && window.supabase && window.supabase.createClient) {
-      S.store = supaStore(window.supabase.createClient(cfg.supabaseUrl, cfg.supabaseKey));
-      S.store.onAuth(refreshIdentity);
+      S.store = supaStore(window.supabase.createClient(cfg.supabaseUrl, cfg.supabaseKey, { auth: { persistSession: false, autoRefreshToken: false, detectSessionInUrl: false } }));
     } else if (!cfg && window.claude && typeof window.claude.use === "function") {
       const [db, user] = await Promise.all([window.claude.use("db"), window.claude.use("user")]);
       if (db) S.store = claudeStore(db, user);
