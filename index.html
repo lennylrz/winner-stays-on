@@ -462,7 +462,8 @@ function normalizeTable(x, no) {
   return T;
 }
 function idleLimit(T) { return T && T.private ? PRIVATE_IDLE_MS : IDLE_MS; }
-function isLive(T, now) { return !!(T && T.sessionId) && now - T.activeAt < idleLimit(T); }
+function people(T) { return T ? (T.a ? 1 : 0) + (T.b ? 1 : 0) + T.queue.length : 0; }
+function isLive(T, now) { return !!(T && T.sessionId) && people(T) > 0 && now - T.activeAt < idleLimit(T); }
 function newSession(no, id, now, priv) { return { ...defaultTable(no), sessionId: id, startedAt: now, activeAt: now, private: !!priv }; }
 function fillTable(T0) {
   const T = { ...T0, queue: [...T0.queue] };
@@ -844,6 +845,7 @@ function viewTable(no) {
     w && h("div", { class: "row" }, h("button", { type: "button", class: "btn primary", id: "start-here", onclick: () => startSession(no) }, icon("plus"), "Start a session"))));
   else if (T) {
     if (canWrite() && !mine(T) && (S.kind === "supabase" || !w)) court.append(joinCard(T));
+    if (S.kind === "supabase" && mine(T)) court.append(h("div", { class: "row" }, h("button", { type: "button", class: "ghost-floor", id: "leave", onclick: () => leaveTable(no) }, "Leave table")));
     const below = belowTable(T, w);
     if (below) court.append(below);
     court.append(sessionLine(T, w));
@@ -1155,7 +1157,7 @@ function updateSheet(force) {
   } else if (sh.type === "account") {
     sheetEls.body.replaceChildren(...accountBody());
   } else if (sh.type === "start") {
-    sheetEls.body.replaceChildren(...startBody(sh));
+    sheetEls.body.replaceChildren(...startBody(sh).filter(Boolean));
   } else if (sh.type === "picker") {
     sheetEls.dyn.replaceChildren(...pickerList(sh));
     const n = sh.sel.length;
@@ -1497,7 +1499,12 @@ function cleanTable(T) {
 }
 function commitTable(T, code) {
   const prev = tableOf(T.no);
-  const next = cleanTable({ ...T, activeAt: Date.now() });
+  let next = cleanTable({ ...T, activeAt: Date.now() });
+  // A session ends by itself once nobody is left, or once a game loses one of its two players
+  if (next.sessionId && (people(next) === 0 || (people(next) < 2 && people(prev) >= 2))) {
+    next = { ...defaultTable(T.no), activeAt: Date.now() };
+    if (S.current === T.no) { S.pick = null; S.custom = null; }
+  }
   S.tables.set(T.no, next);
   rerender();
   return writeTable(next, code).then(() => true, e => { S.tables.set(T.no, prev); rerender(); writeFailed(e, "That change wasn’t saved."); return false; });
@@ -1663,6 +1670,15 @@ function stepOff(side) {
   if (side === "a") { next.a = next.b; next.b = null; next.streak = 0; } else next.b = null;
   S.pick = null; S.custom = null;
   commitTable(fillTable(next));
+}
+function leaveTable(no) {
+  const T = liveOf(no);
+  if (!T || !mine(T)) return;
+  const me = S.uid, next = { ...T, queue: T.queue.filter(id => id !== me) };
+  if (next.a === me) { next.a = next.b; next.b = null; next.streak = 0; }
+  else if (next.b === me) next.b = null;
+  S.pick = null; S.custom = null;
+  commitTable(fillTable(next)).then(ok => { if (ok) showToast({ text: liveOf(no) ? "You left Table " + no + "." : "You left, so the session on Table " + no + " has ended." }); });
 }
 function addToQueue(ids, no) {
   const T = liveOf(no);
